@@ -66,6 +66,8 @@ class OpenAIServer:
         else:
             self.model = model
 
+        self.latest_status = None
+
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             # terminate rank0 worker
@@ -178,6 +180,12 @@ class OpenAIServer:
             if isinstance(iter_result, IterationResult):
                 for stat in iter_result.get_latest(iter_perf_latest_stats_size):
                     stats.append(stat)
+
+                # Return the latest_stats if do not get meaningful results
+                if len(stats) == 0:
+                    stats = self.latest_status
+                else:
+                    self.latest_status = stats[-1]
         else:
             async for stat in self.llm.get_stats_async(2):
                 stats.append(stat)
