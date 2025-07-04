@@ -26,23 +26,12 @@ ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-a
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
 // Container configuration
-def getContainerURIs()
-{
-    // available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
-    // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-    tagProps = readProperties file: "${LLM_ROOT}/jenkins/current_image_tags.properties", interpolate: true
-    uris = [:]
-    keys = [
-        "LLM_DOCKER_IMAGE",
-        "LLM_SBSA_DOCKER_IMAGE",
-        "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE",
-        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"
-    ]
-    for (key in keys) {
-        uris[key] = tagProps[key]
-    }
-    return uris
-}
+// available tags can be found in: https://urm.nvidia.com/artifactory/sw-tensorrt-docker/tensorrt-llm/
+// [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
+LLM_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.05-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202506271620-5539"
+LLM_SBSA_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.05-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202506271620-5539"
+LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py310-trt10.11.0.33-skip-tritondevel-202506271620-5539"
+LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:cuda-12.9.0-devel-rocky8-x86_64-rocky8-py312-trt10.11.0.33-skip-tritondevel-202506271620-5539"
 
 // TODO: Move common variables to an unified location
 BUILD_CORES_REQUEST = "8"
@@ -326,17 +315,14 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
-    image = "urm.nvidia.com/docker/golang:1.22"
-    setupPipelineSpec = createKubernetesPodConfig(image, "build")
+    setupPipelineSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         sh "env | sort"
         updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
         echo "Using GitLab repo: ${LLM_REPO}."
         sh "git config --global --add safe.directory \"*\""
-        // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
         if (env.gitlabMergeRequestLastCommit) {
             env.gitlabCommit = env.gitlabMergeRequestLastCommit
-            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         } else {
             branch = env.gitlabBranch ? env.gitlabBranch : "main"
             trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
@@ -348,9 +334,6 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-        getContainerURIs().each { k, v ->
-            globalVars[k] = v
-        }
     })
 }
 
@@ -882,9 +865,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
-                        'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
-                        'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
-                        'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                        'dockerImage': LLM_DOCKER_IMAGE,
+                        'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+                        'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
                         'globalVars': globalVarsJson,
                     ]
 
@@ -917,14 +900,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                     try {
                         parameters = getCommonParameters()
+
                         String testFilterJson = writeJSON returnText: true, json: testFilter
                         String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
-                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
-                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
-                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                            'dockerImage': LLM_DOCKER_IMAGE,
+                            'wheelDockerImagePy310': LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+                            'wheelDockerImagePy312': LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
                             'globalVars': globalVarsJson,
                         ]
 
@@ -981,7 +965,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     String globalVarsJson = writeJSON returnText: true, json: globalVars
                     parameters += [
                         'enableFailFast': enableFailFast,
-                        "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        "dockerImage": LLM_SBSA_DOCKER_IMAGE,
                         'globalVars': globalVarsJson,
                     ]
 
@@ -1015,12 +999,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                     try {
                         def parameters = getCommonParameters()
+
                         String testFilterJson = writeJSON returnText: true, json: testFilter
                         String globalVarsJson = writeJSON returnText: true, json: globalVars
                         parameters += [
                             'enableFailFast': enableFailFast,
                             'testFilter': testFilterJson,
-                            "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                            "dockerImage": LLM_SBSA_DOCKER_IMAGE,
                             'globalVars': globalVarsJson,
                         ]
 
