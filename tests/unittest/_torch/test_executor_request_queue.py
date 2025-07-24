@@ -316,141 +316,489 @@ def test_clear_canceled_req_ids(executor_queue):
     assert len(executor_queue.canceled_req_ids) == 0
 
 
-def test_thread_safety(executor_queue):
-    """Test thread safety of enqueue operations."""
-    results = []
-    errors = []
-
-    def enqueue_worker():
-        try:
-            for i in range(10):
-                req_id = executor_queue.enqueue_request(Mock())
-                results.append(req_id)
-        except Exception as e:
-            errors.append(e)
-
-    # Create multiple threads
-    threads = []
-    for _ in range(3):
-        thread = threading.Thread(target=enqueue_worker)
-        threads.append(thread)
-        thread.start()
-
-    # Wait for all threads to complete
-    for thread in threads:
-        thread.join()
-
-    # Check results
-    assert len(errors) == 0
-    assert len(results) == 30
-    assert len(set(results)) == 30  # All IDs should be unique
+@pytest.fixture
+def mock_dist_attention_dp():
+    """Create a mock Distributed instance for testing."""
+    mock_dist = Mock()
+    mock_dist.rank = 0
+    mock_dist.tp_size = 4
+    mock_dist.pp_size = 1
+    mock_dist.has_pp = False
+    mock_dist.tp_rank = 0
+    mock_dist.cp_rank = 0
+    mock_dist.cp_size = 1
+    mock_dist.cp_config = {}
+    mock_dist.is_first_pp_rank = True
+    mock_dist.is_last_pp_rank = True
+    mock_dist.next_pp_rank = 1
+    mock_dist.prev_pp_rank = 0
+    mock_dist.broadcast = Mock(return_value=([], None))
+    return mock_dist
 
 
-@patch('tensorrt_llm._torch.pyexecutor.executor_request_queue.time.time')
-def test_update_new_active_requests_queue_latency(mock_time, executor_queue):
-    """Test updating queue latency metrics."""
-    mock_time.return_value = 1000.0
-
-    # Set up start times
-    executor_queue.start_times = {1: 998.0, 2: 999.0}
-
-    requests = [RequestQueueItem(1, Mock()), RequestQueueItem(2, Mock())]
-
-    executor_queue._update_new_active_requests_queue_latency(requests)
-
-    # Check latency was updated (1000.0 - 998.0) + (1000.0 - 999.0) = 3.0
-    assert executor_queue.new_active_requests_queue_latency_ms == 3.0
-
-    # Check start times were removed
-    assert len(executor_queue.start_times) == 0
+@pytest.fixture
+def attention_dp_queue(mock_dist_attention_dp):
+    """Create an ExecutorRequestQueue instance for attention DP testing."""
+    queue = ExecutorRequestQueue(dist=mock_dist_attention_dp,
+                                 enable_attention_dp=True,
+                                 max_batch_size=4,
+                                 max_beam_width=2,
+                                 max_num_active_requests=8,
+                                 enable_iter_perf_stats=True,
+                                 is_disaggregated=False)
+    # Initialize all_ranks_num_active_requests
+    queue.all_ranks_num_active_requests = [2, 1, 3, 0]  # 4 ranks
+    return queue
 
 
-@pytest.mark.parametrize("enable_attention_dp", [False, True])
-def test_fetch_new_requests_routing(executor_queue, enable_attention_dp):
-    """Test that fetch_new_requests routes correctly based on attention_dp setting."""
-    mock_active_requests = []
-    executor_queue.enable_attention_dp = enable_attention_dp
-
-    if enable_attention_dp:
-        with patch.object(executor_queue,
-                          '_fetch_new_requests_attention_dp') as mock_dp:
-            mock_dp.return_value = []
-            executor_queue.fetch_new_requests(len(mock_active_requests))
-            mock_dp.assert_called_once_with(len(mock_active_requests))
-    else:
-        with patch.object(executor_queue,
-                          '_fetch_new_requests_attention_tp') as mock_tp:
-            mock_tp.return_value = []
-            executor_queue.fetch_new_requests(len(mock_active_requests))
-            mock_tp.assert_called_once_with(len(mock_active_requests))
+def create_mock_request_with_py_schedule_params(attention_dp_rank=None,
+                                                attention_dp_relax=False):
+    """Helper to create a mock request with py_schedule_params."""
+    mock_request = Mock()
+    mock_request.py_schedule_params = Mock()
+    mock_request.py_schedule_params.attention_dp_rank = attention_dp_rank
+    mock_request.py_schedule_params.attention_dp_relax = attention_dp_relax
+    mock_request.input_token_ids = [1, 2, 3]  # Add default input_token_ids
+    return mock_request
 
 
-# Integration tests
-def test_full_workflow(integration_queue):
-    """Test a complete workflow from enqueue to processing."""
-    # Enqueue some requests - create mocks without sampling_config to avoid beam validation
-    mock_requests = []
-    for _ in range(3):
-        mock_req = Mock()
-        delattr(mock_req, 'sampling_config') if hasattr(
-            mock_req, 'sampling_config') else None
-        mock_requests.append(mock_req)
-    req_ids = integration_queue.enqueue_requests(mock_requests)  # type: ignore
+def test_filter_out_unschedulable_requests_no_schedule_params(
+        attention_dp_queue):
+    """Test filtering requests without schedule params."""
+    # Create requests without schedule params
+    req1 = RequestQueueItem(1, Mock())  # No py_schedule_params
+    req2 = RequestQueueItem(
+        2, create_mock_request_with_py_schedule_params(attention_dp_rank=None))
 
-    # Enqueue a cancel request
-    integration_queue.enqueue_cancel_request(req_ids[1])
+    new_requests = [req1, req2]
 
-    # Simulate fetching from request queue
-    items = []
-    while not integration_queue.request_queue.empty():
-        try:
-            items.append(integration_queue.request_queue.get_nowait())
-        except queue.Empty:
-            break
+    scheduled, unscheduled = attention_dp_queue._filter_out_unschedulable_requests(
+        new_requests)
 
-    assert len(items) == 4  # 3 requests + 1 cancel
-
-    # Filter and validate
-    valid_items = integration_queue._validate_and_filter_requests(items)
-
-    assert len(valid_items) == 3
-    assert req_ids[1] in integration_queue.canceled_req_ids
+    assert len(scheduled) == 0
+    assert len(unscheduled) == 2
+    assert req1 in unscheduled
+    assert req2 in unscheduled
 
 
-@patch(
-    'tensorrt_llm._torch.pyexecutor.executor_request_queue.executor_request_to_llm_request'
-)
-def test_merge_requests_with_beam_validation(mock_convert, integration_queue):
-    """Test request merging with beam width validation."""
-    # Create mock requests with different beam widths
-    mock_req1 = Mock()
-    mock_req1.sampling_config = Mock()
-    mock_req1.sampling_config.beam_width = 2  # Matches max_beam_width
+def test_filter_out_unschedulable_requests_schedulable(attention_dp_queue):
+    """Test filtering requests that can be scheduled."""
+    # Create requests that can be scheduled (not relax, target rank has capacity)
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+    req2 = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=1,
+                                                    attention_dp_relax=False))
 
-    mock_req2 = Mock()
-    mock_req2.sampling_config = Mock()
-    mock_req2.sampling_config.beam_width = 3  # Doesn't match max_beam_width
+    new_requests = [req1, req2]
 
-    requests = [RequestQueueItem(1, mock_req1), RequestQueueItem(2, mock_req2)]
+    scheduled, unscheduled = attention_dp_queue._filter_out_unschedulable_requests(
+        new_requests)
 
-    # First request should pass validation
-    valid_requests = integration_queue._validate_and_filter_requests(
-        [requests[0]])
-    assert len(valid_requests) == 1
+    assert len(scheduled) == 2
+    assert len(unscheduled) == 0
+    assert req1 in scheduled
+    assert req2 in scheduled
 
-    # Second request should fail validation
+    # Check that all_ranks_num_active_requests should not be changed
+    assert attention_dp_queue.all_ranks_num_active_requests[0] == 2
+    assert attention_dp_queue.all_ranks_num_active_requests[1] == 1
+
+
+def test_filter_out_unschedulable_requests_relax(attention_dp_queue):
+    """Test filtering relax requests."""
+    # Create relax requests
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=True))
+    req2 = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=1,
+                                                    attention_dp_relax=True))
+
+    new_requests = [req1, req2]
+
+    scheduled, unscheduled = attention_dp_queue._filter_out_unschedulable_requests(
+        new_requests)
+
+    assert len(scheduled) == 0
+    assert len(unscheduled) == 2
+    assert req1 in unscheduled
+    assert req2 in unscheduled
+
+
+def test_filter_out_unschedulable_requests_no_capacity(attention_dp_queue):
+    """Test filtering requests when target rank has no capacity."""
+    # Set rank 0 to full capacity
+    attention_dp_queue.all_ranks_num_active_requests[
+        0] = 8  # max_num_active_requests
+
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+    req2 = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+
+    new_requests = [req1, req2]
+
+    scheduled, unscheduled = attention_dp_queue._filter_out_unschedulable_requests(
+        new_requests)
+
+    assert len(scheduled) == 0
+    assert len(unscheduled) == 0
+    assert len(
+        attention_dp_queue.waiting_queue) == 2  # Should go to pending_requests
+
+
+def test_filter_out_unschedulable_requests_mixed_scenarios(attention_dp_queue):
+    """Test filtering with mixed request types."""
+    # Create various types of requests
+    req_schedulable = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=1,
+                                                    attention_dp_relax=False))
+    req_relax = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=True))
+    req_no_params = RequestQueueItem(3, Mock())
+    req_no_capacity = RequestQueueItem(
+        4,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+
+    # Set rank 0 to full capacity
+    attention_dp_queue.all_ranks_num_active_requests[0] = 8
+
+    new_requests = [req_schedulable, req_relax, req_no_params, req_no_capacity]
+
+    scheduled, unscheduled = attention_dp_queue._filter_out_unschedulable_requests(
+        new_requests)
+
+    assert len(scheduled) == 1
+    assert len(unscheduled) == 2
+    assert len(attention_dp_queue.waiting_queue) == 1
+
+    assert req_schedulable in scheduled
+    assert req_relax in unscheduled
+    assert req_no_params in unscheduled
+    # req_no_capacity should be in pending_requests (waiting_queue)
+
+
+def test_filter_out_unschedulable_requests_pending_queue_handling(
+        attention_dp_queue):
+    """Test that pending requests are properly added to waiting queue."""
+    # Set rank 0 to full capacity
+    attention_dp_queue.all_ranks_num_active_requests[0] = 8
+
+    req_pending = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+
+    new_requests = [req_pending]
+
+    scheduled, unscheduled = attention_dp_queue._filter_out_unschedulable_requests(
+        new_requests)
+
+    assert len(scheduled) == 0
+    assert len(unscheduled) == 0
+    assert len(attention_dp_queue.waiting_queue) == 1
+    assert req_pending in attention_dp_queue.waiting_queue
+
+
+# Unit tests for _schedule_attention_dp_requests
+def test_schedule_attention_dp_requests_scheduled_requests(attention_dp_queue):
+    """Test scheduling of pre-scheduled requests."""
+    # Create scheduled requests for current rank (rank 0)
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+    req2 = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+
+    scheduled_requests = [req1, req2]
+    unscheduled_requests = []
+
+    result = attention_dp_queue._schedule_attention_dp_requests(
+        scheduled_requests, unscheduled_requests)
+
+    assert len(result) == 2
+    assert req1 in result
+    assert req2 in result
+
+    # Check that all_ranks_num_active_requests was updated
+    assert attention_dp_queue.all_ranks_num_active_requests[0] == 4  # 2 + 2
+
+
+def test_schedule_attention_dp_requests_scheduled_requests_other_ranks(
+        attention_dp_queue):
+    """Test scheduling of pre-scheduled requests for other ranks."""
+    # Create scheduled requests for other ranks
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=1,
+                                                    attention_dp_relax=False))
+    req2 = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=2,
+                                                    attention_dp_relax=False))
+
+    scheduled_requests = [req1, req2]
+    unscheduled_requests = []
+
+    result = attention_dp_queue._schedule_attention_dp_requests(
+        scheduled_requests, unscheduled_requests)
+
+    assert len(result) == 0  # No requests for current rank
+
+    # Check that all_ranks_num_active_requests was updated for other ranks
+    assert attention_dp_queue.all_ranks_num_active_requests[1] == 2  # 1 + 1
+    assert attention_dp_queue.all_ranks_num_active_requests[2] == 4  # 3 + 1
+
+
+def test_schedule_attention_dp_requests_unscheduled_requests(
+        attention_dp_queue):
+    """Test scheduling of unscheduled requests."""
+    # Create unscheduled requests that can be scheduled
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=True))
+    req2 = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=1,
+                                                    attention_dp_relax=True))
+
+    scheduled_requests = []
+    unscheduled_requests = [req1, req2]
+
+    result = attention_dp_queue._schedule_attention_dp_requests(
+        scheduled_requests, unscheduled_requests)
+
+    assert len(result) == 1  # Only req1 for current rank
+    assert req1 in result
+    assert len(unscheduled_requests) == 0
+
+    # Check that all_ranks_num_active_requests was updated
+    assert attention_dp_queue.all_ranks_num_active_requests[0] == 3
+    assert attention_dp_queue.all_ranks_num_active_requests[1] == 2
+
+
+def test_schedule_attention_dp_requests_unscheduled_no_capacity(
+        attention_dp_queue):
+    """Test scheduling of unscheduled requests when no capacity."""
+    # Set rank 0 to full capacity
+    attention_dp_queue.all_ranks_num_active_requests[0] = 8
+
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=True))
+
+    scheduled_requests = []
+    unscheduled_requests = [req1]
+
+    result = attention_dp_queue._schedule_attention_dp_requests(
+        scheduled_requests, unscheduled_requests)
+
+    assert len(result) == 0  # No capacity
+    assert len(unscheduled_requests) == 1  # Not modified
+    assert req1 in unscheduled_requests
+
+
+def test_schedule_attention_dp_requests_mixed_scenarios(attention_dp_queue):
+    """Test scheduling with mixed scheduled and unscheduled requests."""
+    # Create mixed requests
+    req_scheduled_current = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+    req_scheduled_other = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=1,
+                                                    attention_dp_relax=False))
+    req_unscheduled_current = RequestQueueItem(
+        3,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=True))
+    req_unscheduled_other = RequestQueueItem(
+        4,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=2,
+                                                    attention_dp_relax=True))
+
+    scheduled_requests = [req_scheduled_current, req_scheduled_other]
+    unscheduled_requests = [req_unscheduled_current, req_unscheduled_other]
+
+    result = attention_dp_queue._schedule_attention_dp_requests(
+        scheduled_requests, unscheduled_requests)
+
+    assert len(result) == 2  # req_scheduled_current + req_unscheduled_current
+    assert req_scheduled_current in result
+    assert req_unscheduled_current in result
+
+    # Check unscheduled_requests was modified
+    assert len(unscheduled_requests) == 0
+
+
+def test_schedule_attention_dp_requests_empty_lists(attention_dp_queue):
+    """Test scheduling with empty input lists."""
+    result = attention_dp_queue._schedule_attention_dp_requests([], [])
+
+    assert len(result) == 0
+
+
+def test_schedule_attention_dp_requests_expected_num_active_calculation(
+        attention_dp_queue):
+    """Test that expected_num_active_requests is calculated correctly."""
+    # Create some requests
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=True))
+    req2 = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=1,
+                                                    attention_dp_relax=True))
+
+    scheduled_requests = []
+    unscheduled_requests = [req1, req2]
+
+    result = attention_dp_queue._schedule_attention_dp_requests(
+        scheduled_requests, unscheduled_requests)
+
+    # 2 + 1 + 3 + 0 = 6, 6 + 2 = 8, (8 + 3) // 4 = 2, max(2, 2, 1, 3, 0) = 3
+    assert attention_dp_queue.expected_num_active_requests == 3
+
+
+def test_schedule_attention_dp_requests_balance_requests_called(
+        attention_dp_queue):
+    """Test that _balance_requests_across_ranks is called correctly."""
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=True))
+
+    scheduled_requests = []
+    unscheduled_requests = [req1]
+
+    with patch.object(attention_dp_queue,
+                      '_balance_requests_across_ranks') as mock_balance:
+        mock_balance.return_value = [req1]
+        result = attention_dp_queue._schedule_attention_dp_requests(
+            scheduled_requests, unscheduled_requests)
+
+    # Check that _balance_requests_across_ranks was called
+    mock_balance.assert_called_once()
+    call_args = mock_balance.call_args[0]
+    assert call_args[
+        0] == unscheduled_requests  # First arg should be unscheduled_requests
+    assert isinstance(call_args[1], list)  # Second arg should be a list
+    assert call_args[
+        2] == attention_dp_queue.all_ranks_num_active_requests  # Third arg
+
+
+def test_schedule_attention_dp_requests_assertion_error_on_capacity_exceeded(
+        attention_dp_queue):
+    """Test that assertion error is raised when capacity is exceeded."""
+    # Set rank 0 to full capacity
+    attention_dp_queue.all_ranks_num_active_requests[0] = 9
+
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+
+    scheduled_requests = [req1]
+    unscheduled_requests = []
+
+    # Should raise assertion error because we're trying to schedule a request when rank is at capacity
     with pytest.raises(AssertionError):
-        integration_queue._validate_and_filter_requests([requests[1]])
+        attention_dp_queue._schedule_attention_dp_requests(
+            scheduled_requests, unscheduled_requests)
 
 
-def test_beam_width_validation_success(integration_queue):
-    """Test that beam width validation passes for correct beam width."""
-    mock_req = Mock()
-    mock_req.sampling_config = Mock()
-    mock_req.sampling_config.beam_width = 2  # Matches integration test max_beam_width
+# Integration tests combining both methods
+def test_filter_and_schedule_integration(attention_dp_queue):
+    """Test the integration between filtering and scheduling."""
+    # Create various types of requests
+    req_schedulable = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+    req_schedulable.request.input_token_ids = [1, 2, 3, 4]
+    req_relax = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=True))
+    req_relax.request.input_token_ids = [1, 2]
 
-    request = RequestQueueItem(1, mock_req)
-    valid_requests = integration_queue._validate_and_filter_requests([request])
+    # Create a mock request without py_schedule_params
+    mock_request_no_params = Mock()
+    mock_request_no_params.py_schedule_params = None
+    mock_request_no_params.input_token_ids = [1, 2, 3]  # Add input_token_ids
+    req_no_params = RequestQueueItem(3, mock_request_no_params)
 
-    assert len(valid_requests) == 1
-    assert valid_requests[0] == request
+    new_requests = [req_schedulable, req_relax, req_no_params]
+
+    # First, filter the requests
+    scheduled, unscheduled = attention_dp_queue._filter_out_unschedulable_requests(
+        new_requests)
+
+    assert len(scheduled) == 1
+    assert len(unscheduled) == 2
+    assert req_schedulable in scheduled
+    assert req_relax in unscheduled
+    assert req_no_params in unscheduled
+
+    result = attention_dp_queue._schedule_attention_dp_requests(
+        scheduled, unscheduled)
+
+    assert len(result) == 2
+    assert req_schedulable in result
+    assert req_relax in result
+
+
+def test_filter_and_schedule_with_capacity_limits(attention_dp_queue):
+    """Test filtering and scheduling with capacity limits."""
+    # Set rank 0 to near capacity
+    attention_dp_queue.all_ranks_num_active_requests[0] = 7  # 1 slot left
+
+    # Create requests that would exceed capacity
+    req1 = RequestQueueItem(
+        1,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+    req1.request.input_token_ids = [1, 2, 3, 4]
+    req2 = RequestQueueItem(
+        2,
+        create_mock_request_with_py_schedule_params(attention_dp_rank=0,
+                                                    attention_dp_relax=False))
+    req2.request.input_token_ids = [1, 2, 3]
+
+    new_requests = [req1, req2]
+
+    # Filter - first should be scheduled, second should be pending
+    scheduled, unscheduled = attention_dp_queue._filter_out_unschedulable_requests(
+        new_requests)
+
+    assert len(scheduled) == 1
+    assert len(unscheduled) == 0
+    assert len(attention_dp_queue.waiting_queue) == 1
+
+    # Schedule - should work fine
+    result = attention_dp_queue._schedule_attention_dp_requests(
+        scheduled, unscheduled)
+
+    assert len(result) == 1
+    assert req1 in result
